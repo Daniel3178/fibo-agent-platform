@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"name": "sebx-agent-platform",
+			"path": "."
+		},
+		{
+			"name": "fibonacci_neural_sde",
+			"path": "../fibonacci_neural_sde"
+		}
+	]
+}
