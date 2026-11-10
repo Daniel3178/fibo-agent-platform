@@ -7,6 +7,9 @@
 		{
 			"name": "fibonacci_neural_sde",
 			"path": "../fibonacci_neural_sde"
+		},
+		{
+			"path": "../../../../windev/remote/github/fibonacci_neural_sde"
 		}
 	]
 }
