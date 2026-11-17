@@ -10,6 +10,9 @@
 		},
 		{
 			"path": "../../../../windev/remote/github/fibonacci_neural_sde"
+		},
+		{
+			"path": "../fibo-overleaf/6ae77319f0d898f00cb8c7f3"
 		}
 	]
 }

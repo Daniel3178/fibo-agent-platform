@@ -4,7 +4,7 @@ This document explains one research project from start to finish: a model that g
 
 It is built from two sets of study notes ([fibonacci_neural_sde_gating.md](fibonacci_neural_sde_gating.md) and [gate_input_features_results.md](gate_input_features_results.md)), the code in the `fibonacci_neural_sde` repository (branch `feat/gate-input-features`), and the saved benchmark outputs. All code paths below are relative to that repository's root.
 
-**The one-paragraph version.** The model mixes three "experts", named Bounce, Break and Hover, to predict how a stock price moves near Fibonacci retracement levels. A gate decides how much each expert counts. The paper claims the gate is interpretable: it should say "this is a bounce" when the price is bouncing. In practice it does not. Two rounds of experiments tried to fix this. Changing the regulariser stopped the gate from collapsing but did not make it meaningful. Giving the gate better inputs made it stable and reproducible across random seeds, but what it learned to follow is volatility, not Fibonacci events. The remaining obstacle is the training objective itself.
+**The one-paragraph version.** The model mixes three "experts", named Bounce, Break and Hover, to predict how a stock price moves near Fibonacci retracement levels. A gate decides how much each expert counts. The paper claims the gate is interpretable: it should say "this is a bounce" when the price is bouncing. In practice it does not. Two rounds of experiments tried to fix this. Changing the regulariser stopped the gate from collapsing but did not make it meaningful. Giving the gate better inputs made its routing stable and reproducible across random seeds, but still not about Fibonacci events. Without a regulariser, the gate turned into a volatility dial: it slides weight toward or away from the low-noise Hover expert as volatility changes, and Hover stays on top everywhere. With a regulariser, it splits the price range into fixed horizontal bands, and the little event information it carries is no more than volatility alone provides. The remaining obstacle is the training objective itself.
 
 ## Contents
 
@@ -426,33 +426,60 @@ Code for 5.1–5.5: `amgm/models/neural_SDE/gate_regularizers.py`. Schedules: `a
 
 ### 5.1 Entropy reward (the paper's baseline)
 
-**Purpose.** Stop the gate committing to one expert early in training, before the experts have learned anything.
+**Purpose.** Stop the gate committing to one expert early in training, before the experts have learned anything. Without it, there is a rich-get-richer effect. The expert that happens to start slightly better gets more weight, so it gets more training signal and improves faster, which earns it still more weight. The other experts stop learning (they are *starved*), and the gate collapses onto one expert.
+
+**What entropy measures.** Entropy $H$ is a single number for how spread out the gate's three weights are:
+
+| Gate weights | Situation | $H$ |
+|---|---|---|
+| [1.00, 0.00, 0.00] | Fully committed to one expert | 0 (minimum) |
+| [0.90, 0.05, 0.05] | Nearly committed | 0.39 |
+| [0.50, 0.50, 0.00] | Split between two | 0.69 |
+| [0.33, 0.33, 0.33] | Undecided, equal weights | 1.10 (maximum, $\log 3$) |
 
 **Definition.**
 
 $$R_{\text{entropy}} = \beta \cdot \frac{1}{B}\sum_{b=1}^{B} H(\pi_b), \qquad H(\pi_b) = -\sum_{k=1}^{3} \pi_{b,k}\log \pi_{b,k}$$
 
+$R$ is *subtracted* from the loss, so the model is paid for keeping its weights spread out. Committing hard to one expert costs it reward.
+
+**What $\beta$ is.** $\beta$ is a hand-set strength knob, not a learned parameter. It is the exchange rate between fitting the data and staying spread out. $\beta = 0$ turns the regulariser off, and a large $\beta$ makes the gate uniform. For scale: since $H \le 1.10$, at $\beta = 0.1$ the reward is worth up to about 0.11 in loss units. That is the same size as the fit differences between variants (about 0.05), so it is far from negligible.
+
 **Schedule.** $\beta$ is held at 0.1 for 200 steps, then lowered along a cosine curve to 0.01 over 800 steps:
 
 $$\beta(s) = \begin{cases} \beta_{\max} & s < s_w \\ \beta_{\min} + (\beta_{\max} - \beta_{\min})\cdot\tfrac12\left[1 + \cos\!\left(\pi\,\dfrac{s - s_w}{s_d}\right)\right] & s_w \le s < s_w + s_d \\ \beta_{\min} & \text{afterwards} \end{cases}$$
 
-with step count $s$, warm-up length $s_w$ and decay length $s_d$.
+with step count $s$, warm-up length $s_w$ and decay length $s_d$. In words: keep the push strong while the experts are still random, then weaken it so the gate can commit. The settings are `entropy_beta`, `entropy_beta_min`, `entropy_beta_warmup_steps` and `entropy_beta_decay_steps` in `US_Stocks.py`.
 
 **What it is maximised by.** A uniform gate on every sample (cause 5).
 
 ### 5.2 Adaptive entropy
 
-**Purpose.** Rescue experts that are being starved, by making the entropy reward stronger for them.
+**Purpose.** Rescue experts that are being starved, by making the entropy reward stronger for them. Plain entropy treats all experts the same and does not react specifically when one of them is being neglected.
 
-**Definition.** Each expert gets its own coefficient, which grows when the expert is under-used:
+**Definition.** Entropy is a sum of one piece per expert, $-\pi_k \log \pi_k$. Adaptive entropy gives each piece its own coefficient $\beta_k$, which grows when the expert is under-used:
 
 $$R_{\text{adaptive}} = \frac{1}{B}\sum_{b=1}^{B}\sum_{k=1}^{3} \beta_k\,\big(-\pi_{b,k}\log \pi_{b,k}\big), \qquad \beta_k = \frac{\beta}{\text{clamp}\!\left(\bar p_k \,/\, \tfrac13,\; 0.1,\; 1\right)}$$
 
-- An expert used at or above its fair share ($\bar p_k \ge \tfrac13$) gets $\beta_k = \beta$.
-- An expert used at one tenth of its fair share or less gets $\beta_k = 10\beta$.
-- $\bar p_k$ is treated as a constant when computing gradients, so the model cannot game the coefficient.
+$\beta_k$ is not learned. It is recomputed for every batch from the expert's usage ratio $\bar p_k / \tfrac13$, where 1 means a fair share:
 
-**What it is maximised by.** Still a near-uniform gate. It moves weight toward neglected experts but does not ask for confident routing.
+- An expert used at or above its fair share ($\bar p_k \ge \tfrac13$) gets $\beta_k = \beta$, the normal strength.
+- An expert used less than its fair share gets a boost in proportion to how neglected it is.
+- An expert used at one tenth of its fair share or less gets the maximum boost, $\beta_k = 10\beta$ (the floor is `adaptive_entropy_clip` = 0.1).
+
+**Worked example.** Take $\beta = 0.1$ and a batch with average usage $\bar p = [0.05,\ 0.60,\ 0.35]$:
+
+| Expert | $\bar p_k$ | Ratio | After clamp | $\beta_k$ |
+|---|---|---|---|---|
+| Bounce | 0.05 | 0.15 | 0.15 | **0.667** (6.7× boost) |
+| Break | 0.60 | 1.80 | 1 | 0.1 |
+| Hover | 0.35 | 1.05 | 1 | 0.1 |
+
+The piece $-\pi \log \pi$ rises as $\pi$ goes from 0 toward about 0.37, so the reward always pulls a small weight upward, and $\beta_k$ sets how hard. At $\pi_{\text{Bounce}} = 0.05$ the upward pull is about 0.2 under plain entropy and about 1.33 under adaptive entropy.
+
+**Why $\bar p_k$ is detached.** The code computes usage with `.detach()`, so $\bar p_k$ is treated as a constant when computing gradients. Without that there is a loophole: using an expert *less* raises its $\beta_k$, which raises the reward, so starving an expert would pay off, the opposite of the intent. Detaching lets the model respond to $\beta_k$ but not game it.
+
+**What it is maximised by.** Still a near-uniform gate. It moves weight toward neglected experts but does not ask for confident routing. Neither entropy variant rewards picking the *right* expert for a window, only spreading weight. In Experiment A, adaptive entropy did rescue the starved Bounce expert (validation share from 0% to 36%), but the gate stayed uniform-soft (entropy 0.935).
 
 ### 5.3 Temperature annealing
 
@@ -472,13 +499,45 @@ $$R_{\text{adaptive}} = \frac{1}{B}\sum_{b=1}^{B}\sum_{k=1}^{3} \beta_k\,\big(-\
 
 $$R_{\text{RV}} = \beta \cdot \frac{1}{3}\sum_{k=1}^{3} \text{Var}_b\big(\pi_{b,k}\big), \qquad \text{Var}_b(\pi_{b,k}) = \frac{1}{B}\sum_{b=1}^{B}\big(\pi_{b,k} - \bar p_k\big)^2$$
 
+$R_{\text{RV}}$ is a reward. Like the entropy reward it is subtracted from the loss, but it pays for the opposite thing.
+
+**In plain terms.** Picture the batch as a table with one row per window ($b = 1 \dots 256$) and one column per expert. Each cell $\pi_{b,k}$ is a single number: the weight expert $k$ gets on window $b$. Each row adds up to 1. Regional variance works on the **columns**. For each expert:
+
+1. Average its column. This gives $\bar p_k$, its usage.
+2. For every window, take the gap $\pi_{b,k} - \bar p_k$ and square it.
+3. Average the squared gaps. That is the column's variance.
+
+Then the three variances are averaged and multiplied by $\beta$. In code this is `torch.var(pi, dim=0, unbiased=False).mean()`. `dim=0` runs *across windows*, the opposite direction from $\sigma_{20}$, which runs along the days inside one window. A column only has variance if the expert's weight changes from window to window. Like $\bar p_k$, it is a batch statistic.
+
+**Worked example.** A batch of 4 windows whose average usage is the $\bar p = [0.05,\ 0.60,\ 0.35]$ of the section 5.2 example:
+
+| Expert | Weights on windows 1–4 | $\bar p_k$ | Squared gaps | Variance |
+|---|---|---|---|---|
+| Bounce | 0.10, 0.00, 0.05, 0.05 | 0.05 | 0.0025, 0.0025, 0, 0 | 0.00125 |
+| Break | 0.70, 0.80, 0.50, 0.40 | 0.60 | 0.01, 0.04, 0.01, 0.04 | 0.025 |
+| Hover | 0.20, 0.20, 0.45, 0.55 | 0.35 | 0.0225, 0.0225, 0.01, 0.04 | 0.02375 |
+
+The average over experts is 0.0167, so $R_{\text{RV}} = 0.117$ at $\beta = 7$. Bounce adds almost nothing, because the gate gives it the same small weight everywhere and does not use it to tell windows apart.
+
+**What scores high and low.**
+
+| Gate behaviour | Variance per expert | Average |
+|---|---|---|
+| Uniform, [⅓, ⅓, ⅓] on every window | 0, 0, 0 | **0** |
+| Collapsed, [1, 0, 0] on every window | 0, 0, 0 | **0** |
+| Soft and slightly varying (example above) | 0.001, 0.025, 0.024 | 0.017 |
+| One-hot, only two experts used, half each | 0.25, 0.25, 0 | 0.167 |
+| One-hot, all three used equally | 2/9, 2/9, 2/9 | **0.222** (the maximum) |
+
+Uniform and collapsed gates both score zero, because every window gets the same weights. That is why this one reward fights both failure modes at once. The name "regional" reflects the ideal: different regions of the input space go to different experts.
+
 **What it is maximised by.** If every sample gets the same $\pi$, the variance is 0. The variance is largest when each sample picks exactly one expert (one-hot routing) and the experts share the samples equally. In that case each $\pi_{b,k}$ is 1 for a third of the samples and 0 for the rest, a Bernoulli variable with probability $\tfrac13$:
 
 $$\text{Var} = \tfrac13\left(1 - \tfrac13\right) = \tfrac29 \approx 0.222$$
 
 The trained models reach 0.219–0.220, essentially the maximum.
 
-**Settings used.** $\beta$ from 7 down to 1.5, balance $\lambda = 2$, and temperature annealing from 5 to 0.5.
+**Settings used.** $\beta$ from 7 down to 1.5, balance $\lambda = 2$, and temperature annealing from 5 to 0.5. At $\beta = 7$, a perfectly one-hot, balanced gate earns $7 \times 0.222 \approx 1.56$ in loss units, against fit differences of about 0.05 between variants. The reward outweighs anything the fit can offer, so the gate is driven to one-hot routing.
 
 **What it does not do.** It rewards *any* confident, balanced split of the inputs. It has no idea which split corresponds to bounces and breaks.
 
@@ -529,12 +588,90 @@ flowchart LR
 | Approach (1) | `approach` | $-\text{sign}(x_t - L^\ast)\cdot\text{sign}(x_t - x_{t-1})$ | $+1$ if moving toward the nearest level, $-1$ if moving away |
 | Velocity (3) | `vel_1`, `vel_5`, `vel_10` | $(x_t - x_{t-k})\,/\,(\sigma_{20}\sqrt{k})$ for $k = 1, 5, 10$ | Momentum over 1, 5 and 10 days, in volatility units |
 | Volatility regime (1) | `log_vol_ratio` | $\log(\sigma_{20}/\sigma_{60})$ | Positive if volatility is expanding, negative if contracting |
-| Range versus volatility (1) | `log_range_vol` | $\log\big(\delta\,/\,(\sigma_{20}\sqrt{252})\big)$ | Large for a trending year, small for a noisy one |
+| Range versus volatility (1) | `log_range_vol` | $\log\big(\delta\,/\,(\sigma_{20}\sqrt{252})\big)$ | Large for a quiet, trending year, small for a noisy one |
 | Dwell (1) | `zone_days` | Consecutive days, ending today, within $0.02\,\delta$ of $L^\ast$, capped at 20, divided by 20 | How long the price has been sitting at the level |
 
 Unlike $f_t$, the distance features are divided by recent volatility, not by the range. That restores the scale information that cause 1 showed was missing.
 
-**The `vol_only` feature set (2 features).** Only `log_vol_ratio` and `log_range_vol`. This is a control, not a candidate. It answers one question: *if the gate is given nothing but volatility, does it do just as well?* If yes, then whatever the gate learned from `price_v1` was about volatility, not about Fibonacci levels.
+**What "volatility" means here.** $\sigma_{20}$ and $\sigma_{60}$ are the standard deviations of the daily changes $x_s - x_{s-1}$ over the last 20 and 60 days. Because each window is min-max scaled (`amgm/data/neural_SDE.py`, `_min_max_normalize`), $x$ is measured as a fraction of the window's high-low range, so $\sigma_{20}$ is *the typical daily move as a fraction of the year's range*. For the same reason $\delta = 1$ in every window, so `log_range_vol` reduces to $-\log(\sigma_{20}\sqrt{252})$: it is simply the volatility **level**. `log_vol_ratio` is the volatility **trend**. Neither says where the price is relative to a level or which way it is moving.
+
+#### The features in plain terms
+
+**Two rulers.** Every feature is built from two measuring sticks:
+
+- **The price scale.** Each window is rescaled so the year's lowest price is 0 and its highest is 1. A price of 0.55 means "55% of the way from this year's low to its high". The Fibonacci levels therefore always sit at 0, 0.236, 0.382, 0.5, 0.618, 0.786 and 1.
+- **The typical daily move, $\sigma_{20}$.** This is how much the price usually moves in a day over the last 20 days. A choppy stock might have $\sigma_{20} = 0.05$, a calm one 0.01.
+
+Most features are divided by $\sigma_{20}$, so they are measured in **typical days** rather than raw distance. A level 0.05 away is 1 typical day away for the choppy stock, so it could be hit tomorrow. For the calm stock it is 5 typical days away and needs a real move. Both rulers are computed **separately for each window**, from that window's own prices, so a window's features do not depend on which other windows share its batch.
+
+**A running example.**
+
+| | Value |
+|---|---|
+| Today's price $x_t$ | 0.55 |
+| Yesterday | 0.54 |
+| 5 days ago | 0.50 |
+| 10 days ago | 0.47 |
+| $\sigma_{20}$ | 0.02 |
+| $\sigma_{60}$ | 0.025 |
+
+**Group 1: how far is each level? (`dist_vol_0` … `dist_vol_6`).** For each level, (today's price − level) ÷ $\sigma_{20}$. Positive means the price is above the level, negative means below, and values beyond ±5 are capped and simply read as "far away".
+
+| Level | Distance | ÷ $\sigma_{20}$ | Feature |
+|---|---|---|---|
+| 0 | +0.55 | +27.5 | +5 |
+| 0.236 | +0.314 | +15.7 | +5 |
+| 0.382 | +0.168 | +8.4 | +5 |
+| 0.5 | +0.05 | +2.5 | **+2.5** |
+| 0.618 | −0.068 | −3.4 | **−3.4** |
+| 0.786 | −0.236 | −11.8 | −5 |
+| 1 | −0.45 | −22.5 | −5 |
+
+The price sits between the 50% level, 2.5 typical days below it, and the 61.8% level, 3.4 typical days above it.
+
+**Group 2: heading toward or away from the nearest level? (`approach`).** +1 if today's move goes toward the closest level, −1 if it goes away, 0 if the price did not move. In the example the nearest level is 0.5. The price is above it and rose today, so it is moving away: **−1**. This is a yes/no signal with no speed in it.
+
+**Group 3: how fast is the price moving? (`vel_1`, `vel_5`, `vel_10`).** The move over $k$ days ÷ $(\sigma_{20}\sqrt{k})$. The $\sqrt{k}$ is there because random daily moves partly cancel out: after $k$ days, noise alone typically wanders only about $\sqrt{k}$ typical steps. Each feature therefore compares the actual move with what noise would produce. Values around ±1 are normal noise, and ±3 or more is a strong move.
+
+| Feature | Move | Noise yardstick | Value |
+|---|---|---|---|
+| `vel_1` | 0.01 | 0.02 × 1 | 0.50 |
+| `vel_5` | 0.05 | 0.02 × 2.24 | 1.12 |
+| `vel_10` | 0.08 | 0.02 × 3.16 | 1.26 |
+
+This is a steady, moderate climb, no bigger than what noise alone often produces.
+
+**Group 4: calmer or wilder? (`log_vol_ratio`).** $\log(\sigma_{20}/\sigma_{60})$: is the last month choppier than the last three? 0 means the same as usual, +0.69 means recent volatility has doubled, and −0.69 means it has halved. In the example $\log(0.8) = $ **−0.22**, so the stock is calming slightly.
+
+**Group 5: trending or noisy year? (`log_range_vol`).** Pure noise over 252 days would cover a range of about $\sigma_{20}\sqrt{252} \approx 15.9\,\sigma_{20}$. The actual range is 1. A clearly positive value means the range is much bigger than noise explains, so the year trended. Near 0 or negative means the year was choppy and went nowhere. In the example $\log(1/0.318) = $ **+1.15**: the range is about 3 times what noise would make. Because the range is always 1, this feature is really "how small is $\sigma_{20}$".
+
+**Group 6: how long has the price sat at a level? (`zone_days`).** The number of consecutive days, up to today, that the price has stayed within 0.02 of the nearest level (the event detector's tolerance), capped at 20 and divided by 20. 0 means not at a level, 0.5 means 10 days, and 1 means 20 days or more. The count resets as soon as the price leaves the zone. The example's zone around 0.5 is [0.48, 0.52] and today's 0.55 is outside it, so the value is **0**. This is the gate's no-hindsight version of "hovering".
+
+**The example in one sentence.** *The price is 2.5 typical days above the 50% level and 3.4 below the 61.8% level. It is drifting up and away from the 50% level at a normal pace, volatility is easing slightly, the year has been trending, and the price is not sitting on any level.*
+
+**How the three events were meant to look.** This is the intention behind the feature design, not a measured result:
+
+| Event | Distance | Approach | Velocity | Volatility | `zone_days` |
+|---|---|---|---|---|---|
+| Bounce | Close to a level (about ±1) | Was +1, now flipping to −1 | Turning around | Any | Low |
+| Breakout | Crossing zero: the sign flips | Moving through the level | Large, one direction (above 2) | Often rising | Was high, then resets |
+| Hover | Close to a level | Flips back and forth | Near 0 | Calming | High |
+
+In practice the gate did not use the features this way. Under regional variance it used the distance features mainly to cut the price range into fixed bands, and its only event signal came from groups 4 and 5 (sections 8.4 and 8.5).
+
+**The `vol_only` feature set (2 features).** Only `log_vol_ratio` and `log_range_vol`: volatility level and trend, nothing else. The code computes `price_v1` and keeps those two columns. This is a control, not a candidate. It answers one question: *if the gate is given nothing but volatility, does it align with events just as well?* If yes, then the level, approach, velocity and dwell features add no event information that the gate uses beyond what volatility already gives.
+
+Only the gate is restricted. The variant `regional_variance_vol_only` matches `regional_variance_gate_features` in every other respect: the same regulariser, seeds, stocks and split. Its experts still read $h$, and Bounce and Break still take their drift directions from the price. What the restricted gate cannot see:
+
+| Information | `price_v1` gate | `vol_only` gate |
+|---|---|---|
+| Where the price is relative to each level | yes | no |
+| Heading toward or away from a level | yes | no |
+| How fast it moves, and which way | yes | no |
+| How long it has sat at a level | yes | no |
+| How noisy the stock is, and whether that is changing | yes | yes |
+
+The `vol_only` gate is blind to the Fibonacci levels, so any alignment it shows with bounce, break and hover events must come from volatility. It works like a placebo arm. If `price_v1` clearly beats it on the event metrics, the Fibonacci-specific features carry a signal the gate uses. If the two are about equal, they do not.
 
 Code: `amgm/models/neural_SDE/gate_features.py`.
 
@@ -612,6 +749,46 @@ All metrics are produced by the script `gate_health.py` from the diagnostic outp
 | `real_sign_agree` | Fraction of real windows where Bounce and Break drift signs agree | 0.457 in every run (cause 4) |
 
 The difference between the two event metrics matters. `event_mi` scores any gate that separates event types, even if it sends breakouts to the Hover expert. `event_contrast` only scores if events go to the *correctly named* expert.
+
+#### The two event metrics in detail
+
+**Why they are needed.** Entropy, confidence, winner shares and input dependence describe only the gate's *shape*. A gate can score well on all of them and still mean nothing, as regional variance shows. The paper's claim is that the gate is interpretable: it says "Bounce" when the price bounces. Testing that needs labels from outside the model, and these come from the event detector. On the real 2018–2020 paths it finds the same **1,644 events** in every run: 794 bounces (48%), 198 breakouts (12%) and 652 hovers (40%). For each event, Exp 2 records the gate's weights on the event day (`gate_index` in `events.csv`). Both metrics use **only these event moments** and compare the event types with each other. The roughly 97% of unlabelled windows are not used. Code: `gate_health.py`, `summarise()` and `mutual_information()`.
+
+**`event_contrast`: does each expert react to its own events?** First average the gate's weights for each event type. Then, for each expert, take its weight on its own events minus its weight on the other two event types, and average the three differences. Example, `regional_variance_gate_features` on seed 1:
+
+| Event ↓ / Expert → | Bounce | Break | Hover |
+|---|---|---|---|
+| Bounce events | **0.464** | 0.389 | 0.147 |
+| Break events | 0.364 | **0.398** | 0.238 |
+| Hover events | 0.431 | 0.297 | **0.273** |
+| Own minus other | +0.048 | +0.051 | +0.107 |
+
+The average is $+0.069$. The scale runs from +1, where each expert gets all the weight on its own events and none elsewhere, through 0, where the gate does not react to the event type, to negative values, where experts get *less* weight on their own events. The original `baseline` gives about 0.17 / 0.47 / 0.36 on every event type, so its contrast is about 0.01.
+
+**`event_mi`: does the winner tell you the event?** Take each event's winning expert (the largest weight) and count event type against winner. Same run:
+
+| Event ↓ / Winner → | Bounce | Break | Hover |
+|---|---|---|---|
+| Bounce | 368 | 317 | 109 |
+| Break | 72 | 79 | 47 |
+| Hover | 281 | 183 | 188 |
+
+Before looking at the gate, the odds are 48 / 12 / 40. When Hover wins, they shift to 32 / 14 / 55, so that column carries some information. When Bounce wins, they are 51 / 10 / 39, almost unchanged. Mutual information adds up these shifts:
+
+$$I = \sum p(\text{event}, \text{winner}) \log \frac{p(\text{event}, \text{winner})}{p(\text{event})\,p(\text{winner})}$$
+
+It is 0 if the winner never changes the odds. Dividing by $H(\text{event}) = 0.973$ gives $0.018 / 0.973 = 0.019$: knowing the winner removes about 2% of the uncertainty about the event. The scale runs from 0 (unrelated) to 1 (the winner identifies the event exactly).
+
+**Why both are reported.**
+
+| | `event_contrast` | `event_mi` |
+|---|---|---|
+| Uses | Soft weights | Hard winner only |
+| Expert names | Checked | Ignored: relabelling the experts leaves it unchanged |
+
+On `vol_only` seed 3, most bounce events (465 of 794) are won by the *Break* expert. The gate does separate event types, so `event_mi` = 0.029, the best of any run. It attaches them to the wrong names, so `event_contrast` = −0.067. The interpretability claim needs the names to be right. In the opposite direction, weights can lean the right way without changing the winner. That raises contrast but not `event_mi`, which is the pattern of `regional_variance_gate_features` (0.052 against 0.009, means over seeds).
+
+**Why the values are small.** Bounce and break labels need 10 days of hindsight that a causal gate cannot see, so even a perfect gate would not reach 1. Labels are few (198 breakouts), and the scaling mismatch of section 10 lowers the measured alignment further. Compare variants with each other and with the `vol_only` control, not with 1.0.
 
 ### 6.4 Verdicts
 
@@ -822,6 +999,16 @@ flowchart LR
 
 Hover has a small, capped $\sigma$. The other two experts have larger ones. By sliding weight between them, the gate can dial the blended $\sigma$ up and down. The new volatility features tell the gate exactly how much to dial. The gate becomes a **volatility regressor**: it improves the predicted variance without ever changing which expert leads.
 
+This can be read directly off the real-path gate weights in `real_gates.csv`, which store the gate features as columns. The Hover weight falls as volatility expands:
+
+| Seed | corr(`p_hover`, `log_vol_ratio`) | corr(`p_break`, `log_vol_ratio`) |
+|---|---|---|
+| 1 | −0.47 | +0.31 |
+| 2 | −0.31 | +0.29 |
+| 3 | −0.28 | +0.27 |
+
+For the original `baseline`, which reads $h$, the same correlation with Hover is only −0.08 to −0.13. The weights move, but the winner does not: Hover stays on top whatever volatility does.
+
 This is cause 3 seen in the data, and it is the behaviour Weigend, Mangeas and Srivastava (1995) reported for gated experts on time series: without a competitive objective, the split follows volatility.
 
 The fit gain is real. It comes from better variance prediction, not from recognising regimes.
@@ -839,7 +1026,18 @@ With `price_v1` features:
 
 But `event_mi` is still only 0.009. The gate's weights *lean* slightly toward the right expert on its events. Its actual choice still explains under 1% of the event type.
 
-### 8.5 Finding 3: the alignment comes from volatility
+**What the reproducible split is made of.** To see what decides the winner, a small decision tree (depth 4, cross-validated by stock) was trained to predict each real window's top expert from the gate's input features. Chance is 0.33 balanced accuracy.
+
+| Variant | Winner predicted from the 2 volatility features | From the 12 other features | From position in range alone |
+|---|---|---|---|
+| regional_variance (reads $h$) | 0.42–0.50 | 0.87–0.97 | 0.84–0.97 |
+| regional_variance_gate_features | 0.41–0.50 | **0.91–0.98** | **0.83–0.97** |
+| regional_variance_h_plus_features | 0.42–0.43 | 0.97–0.98 | — |
+| regional_variance_vol_only | 0.91–0.98 | 0.52–0.56 | — |
+
+The `price_v1` gate does **not** choose its winner by volatility. It cuts the yearly range into horizontal bands, mostly through `dist_vol_2`, `dist_vol_3` and `dist_vol_5`, so the winner depends on whether the price sits low, in the middle or high in its range. The gate reading $h$ makes the same kind of cut, because $h$ contains the price position. The difference is that its cut points move from seed to seed, while the volatility-scaled distances fix them in place. That is where the reproducibility comes from. A price band is not an event: a price in the middle band can be bouncing, breaking or hovering.
+
+### 8.5 Finding 3: the event information comes from volatility
 
 If level distance, approach, velocity and dwell were what the gate used to recognise events, then removing them should hurt. The `vol_only` control removes all 12 and keeps the 2 volatility features:
 
@@ -850,16 +1048,37 @@ If level distance, approach, velocity and dwell were what the gate used to recog
 | Verdicts | healthy, healthy, non-semantic | healthy, healthy, non-semantic |
 | `val_loss_sde` | −2.500 ± 0.082 | −2.308 ± 0.288 |
 
-The gate with only volatility matches the full gate on event alignment, and beats it on `event_mi` on all three seeds. So **the event alignment the gate gained is volatility alignment**. Breakouts tend to happen when volatility is expanding and hovers when it is contracting, and that correlation is all the gate has picked up.
+The gate with only volatility matches the full gate on event alignment, and beats it on `event_mi` on all three seeds. So **whatever event information the gate carries is no more than volatility provides**. The level, approach, velocity and dwell features add nothing the event metrics can detect.
 
 A separate check supports this. A simple classifier trained to predict the event label directly from the features reached a balanced accuracy of 0.370 from `price_v1` and 0.367 from `vol_only`, against 0.333 for guessing. Nearly all the event information that is available without hindsight sits in the two volatility features.
 
+The events themselves differ only a little in volatility. These are the feature values on the window where the gate is read for each event (the labels are the same real data in every run):
+
+| Event | `log_vol_ratio`, mean (sd) | `log_range_vol`, mean (sd) | Windows |
+|---|---|---|---|
+| Bounce (pullback) | −0.056 (0.27) | 0.34 (0.43) | 794 |
+| Break (breakout) | −0.135 (0.29) | 0.55 (0.42) | 198 |
+| Hover | −0.157 (0.30) | 0.58 (0.43) | 652 |
+| No event | −0.097 (0.32) | 0.49 (0.52) | 53,906 |
+
+Pullbacks happen in somewhat noisier windows, where volatility is not calming down. Breakouts and hovers happen in quieter, calming windows, and volatility cannot tell those two apart. The gaps are about a third of a standard deviation, which is why even the `vol_only` gate reaches an `event_mi` of only 0.027.
+
 Two details are worth understanding:
 
-- **Why fewer features score higher on `event_mi`.** With only volatility to work with, regional variance must split on volatility, and that split happens to correlate with events. With 14 features, the regulariser has many other confident splits available that satisfy it equally well and have nothing to do with events. More inputs give the regulariser more ways to be confidently arbitrary.
+- **Why fewer features score higher on `event_mi`.** With only volatility to work with, regional variance must split on volatility, and that split happens to correlate weakly with events. With 14 features, the regulariser prefers the price-band split shown in section 8.4, which satisfies it just as well and has almost nothing to do with events. More inputs give the regulariser more ways to be confidently arbitrary.
 - **Why the two event metrics disagree for `vol_only` on seed 3** (`event_mi` 0.029, `event_contrast` −0.067). The gate separates event types but attaches them to the *wrong* experts. Since Bounce and Break agree in sign 45.7% of the time, nothing in the objective pins a volatility cluster to a particular expert name. This is causes 2 and 4 seen directly.
 
-The 12 non-volatility features do help with fit and stability. `vol_only` has the worst and most variable loss, and one of its runs (seed 2) appears to have failed.
+**What the `vol_only` gate's split looks like.** With two inputs, regional variance must cut the windows into three volatility regions. The table below averages the features over the windows each expert wins. Across all windows the mean `log_range_vol` is 0.49, and lower means noisier.
+
+| Seed | Gets the noisy windows | Gets calm windows with falling volatility | Gets the rest |
+|---|---|---|---|
+| 1 | **Bounce** (`log_range_vol` 0.00) | Break (`log_vol_ratio` −0.37) | Hover |
+| 2 | **Bounce** (0.02) | Hover (calmest, −0.26) | Break |
+| 3 | **Break** (0.11) | Bounce (−0.33) | Hover (calmest) |
+
+Every seed finds roughly the same regions, but which expert gets which region varies. Bounce events sit in noisier windows (the event table above). Seeds 1 and 2 happened to give the noisy region to Bounce, so contrast is positive and the verdict is `healthy`. Seed 3 gave it to Break, so contrast is negative. The two `healthy` verdicts of `vol_only` come from luck in naming, not from a semantic gate.
+
+The 12 non-volatility features do help with fit and stability. `vol_only` has the worst and most variable loss, and one of its runs (seed 2) appears to have failed. Its winner shares also vary between seeds by 0.04–0.12, against 0.01 or less for `price_v1`. That is why `price_v1` stays the gate input and `vol_only` stays a control. The bar for a Fibonacci-semantic gate is `price_v1` beating `vol_only` on both event metrics, on every seed.
 
 ### 8.6 Finding 4: mixing the features into $h$ dilutes them
 
@@ -871,8 +1090,8 @@ The 12 non-volatility features do help with fit and stability. `vol_only` has th
 flowchart TB
     H0["Hypothesis: the gate is non-semantic<br/>because its inputs are uninformative"] --> Q1{"Do better inputs change<br/>the gate's behaviour?"}
     Q1 -->|"Yes: reproducible split,<br/>seed 3 rescued, fit improves"| Q2{"Does the gate become<br/>Fibonacci-semantic?"}
-    Q2 -->|"Weakly: contrast about 0.05,<br/>event_mi at most 0.03"| Q3{"Is that from the level features,<br/>or from volatility alone?"}
-    Q3 -->|"Volatility alone does as well"| C["Better inputs were necessary<br/>but not sufficient.<br/>The objective rewards a volatility split,<br/>not a Bounce / Break split."]
+    Q2 -->|"No: the split is by price band,<br/>contrast about 0.05,<br/>event_mi at most 0.03"| Q3{"Is the small event signal from the<br/>level features, or from volatility alone?"}
+    Q3 -->|"Volatility alone does as well"| C["Better inputs were necessary<br/>but not sufficient.<br/>The objective rewards a sigma dial<br/>or any confident split,<br/>not a Bounce / Break split."]
 ```
 
 ---
@@ -884,7 +1103,7 @@ flowchart TB
 | Hard collapse and starved experts | Fixed | Regional variance with balance loss, plus gate features to make it hold on every seed |
 | Uniform-soft gate | Fixed | Regional variance |
 | Split depends on the random seed | Fixed | Gate reads `price_v1` features only |
-| Gate reflects volatility, not Fibonacci events | **Open** | Nothing tried so far |
+| Gate is not Fibonacci-semantic: it dials volatility or splits by price band | **Open** | Nothing tried so far |
 | Expert names are not pinned to behaviours | **Open** | Nothing tried so far |
 
 The path of the investigation:
@@ -894,11 +1113,11 @@ flowchart LR
     S0["Start<br/>gate collapses or is uniform"] --> S1["Experiment A<br/>change the regulariser"]
     S1 --> R1["Sharp and balanced,<br/>but arbitrary and seed-dependent"]
     R1 --> S2["Experiment B<br/>change the gate's inputs"]
-    S2 --> R2["Sharp, balanced, reproducible,<br/>but it tracks volatility"]
+    S2 --> R2["Sharp, balanced, reproducible,<br/>but split by price band;<br/>event signal = volatility only"]
     R2 --> S3["Next<br/>change the objective"]
 ```
 
-The bottleneck has moved twice. First it looked like a regulariser problem. Experiment A showed that the regulariser can make the gate sharp but cannot give it meaning. Then it looked like an input problem. Experiment B showed that better inputs make the gate stable, but the gate uses them to follow volatility, because volatility is what the training objective pays for.
+The bottleneck has moved twice. First it looked like a regulariser problem. Experiment A showed that the regulariser can make the gate sharp but cannot give it meaning. Then it looked like an input problem. Experiment B showed that better inputs make the gate stable, but not meaningful. Left alone, the gate uses the volatility features to dial the blended $\sigma$, because predicting the size of the next move is what the training objective pays for. Forced to be sharp by regional variance, it splits on price position, and its only event signal is what volatility alone provides.
 
 What remains is causes 2, 3 and 4 from section 4.2: **under moment mixing, the loss gives the gate no reason to separate Bounce from Break.**
 
@@ -927,7 +1146,7 @@ flowchart LR
     C --> D
     D --> E{"Does price_v1 beat vol_only<br/>on both event metrics,<br/>on every seed?"}
     E -->|yes| F["Semantic gate.<br/>Then check generation and Exp 4"]
-    E -->|"no, still a volatility split"| G["Add weak supervision<br/>from the event labels"]
+    E -->|"no, still a volatility<br/>or price-band split"| G["Add weak supervision<br/>from the event labels"]
 ```
 
 **1. Replace moment mixing with a true mixture likelihood.** This addresses cause 2.
@@ -946,7 +1165,7 @@ is the *responsibility* of expert $k$: the share of credit it deserves for the o
 
 **4. Use more seeds.** With six seeds, six out of six in the same direction gives p ≈ 0.03.
 
-**5. If the gate still splits on volatility, add weak supervision.** Add a penalty that pulls the gate toward the event labels on the 3% of windows that have them, strong at first and then faded, so that the likelihood can override labels it cannot fit.
+**5. If the gate still splits on volatility or price band, add weak supervision.** Add a penalty that pulls the gate toward the event labels on the 3% of windows that have them, strong at first and then faded, so that the likelihood can override labels it cannot fit.
 
 Other options that remain open: a multi-step training objective, which would add up drift over several days and make direction visible (cause 3); a penalty or hidden-Markov structure that makes the gate persistent over time; the mutual-information reward of section 5.6; and a control that replaces the Fibonacci ratios with random ones, to test whether the data contains any Fibonacci-specific signal at all.
 
